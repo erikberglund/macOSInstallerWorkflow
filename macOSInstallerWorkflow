@@ -29,12 +29,13 @@ server_hostname=""
 server_nbi_path="/Library/NetBoot/NetBootSP0"
 server_osimages_path=""
 
-# Script
-script_configuration="" # Optinal
-
 ###
 ### SOURCE CONFIGURATION
 ###
+
+# This will source a configuration file named 'macOSInstallerWorkflow.conf' in a directory named 'macOSInstallerWorkflowConfig'
+script_folder="$( ( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd ) )"
+script_configuration="$( ( cd "${script_folder}/../macOSInstallerWorkflowConfig"; pwd ) )/macOSInstallerWorkflow.conf"
 
 # Source a configuration file that may override any of the above variables
 if [[ -f ${script_configuration} ]]; then

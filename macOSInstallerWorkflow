@@ -21,6 +21,9 @@ base_path="/Users/Shared"
 # DeployStudio
 ds_server_url=""
 
+# NBI
+nbi_enable="true"
+
 # Upload Server Paths
 # NOTE: This script uploads the NBI and OS Image to the same server
 # NOTE: This script assumes that ssh keys have already been exchanged between the client running the script and the server
@@ -532,7 +535,7 @@ function sch_create_ds_nbi() {
 	fi
 	
 	# Disable the NBI by default to let the server enable when ready for testing
-	/usr/libexec/PlistBuddy -c "Set :IsEnabled false" "${nbi_nbimageinfo}"
+	/usr/libexec/PlistBuddy -c "Set :IsEnabled ${nbi_enable}" "${nbi_nbimageinfo}"
 	
 	# Enable verbose boot by default
 	/usr/libexec/PlistBuddy -c  "Add 'Kernel Flags' string '-v'" "${nbi_path}/i386/com.apple.Boot.plist"

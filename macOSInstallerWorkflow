@@ -1,0 +1,607 @@
+#!/bin/bash
+
+###
+### CUSTOM VARIABLES
+###
+
+# App Store
+# To get the ID of an App Store app: 
+#		* Naviage to the app install page,
+#		* Select "Copy Link" from the arrow dropdown to the right of the install button.
+#		* Copy the numbers between '../app/../id' and '?'
+#		* Example: https://itunes.apple.com/se/app/macos-sierra/id1127487414?l=en&mt=12
+#		* Example ID: 1127487414
+appstore_id="1127487414"
+appstore_appleid=""
+appstore_password=""
+
+# Base
+base_path="/Users/Shared"
+
+# DeployStudio
+ds_server_url=""
+
+# Upload Server Paths
+# NOTE: This script uploads the NBI and OS Image to the same server
+# NOTE: This script assumes that ssh keys have already been exchanged between the client running the script and the server
+server_user=""
+server_hostname=""
+server_nbi_path="/Library/NetBoot/NetBootSP0"
+server_osimages_path=""
+
+# Script
+script_configuration="" # Optinal
+
+###
+### SOURCE CONFIGURATION
+###
+
+# Source a configuration file that may override any of the above variables
+if [[ -f ${script_configuration} ]]; then
+	source "${script_configuration}"
+fi
+
+###
+### STATIC VARIABLES
+###
+
+# Script
+script_name="$( basename $0 )"
+declare -a script_mountpoints
+
+# mas-cli
+mas="${base_path}/bin/mas"
+mas_github_repo="mas-cli/mas"
+
+# AutoDMG
+autodmg="${base_path}/Applications/AutoDMG.app"
+autodmg_github_repo="MagerValp/AutoDMG"
+
+# NOTE: This path has to be writeable for the user running this script
+appstore_archive_path="${base_path}/Archive/OSInstallers"
+
+# DeployStudio
+ds_archive_path="${base_path}/Archive/DeployStudio"
+ds_admin="${ds_archive_path}/DeployStudioAdmin.dmg"
+
+# OS Image
+os_images_archive="${base_path}/Archive/OSImages"
+os_images_template="/tmp/${script_name}.adtmpl"
+
+# NBI
+nbi_archive="${base_path}/Archive/NBI"
+
+# Log
+log_path="/tmp/${script_name%.*}.log"
+
+###
+### FUNCTIONS
+###
+
+function sch_trap() {
+	for mountpoint in ${script_mountpoints[@]}; do
+		if [[ -d ${mountpoint} ]]; then
+			/usr/bin/hdiutil detach "${mountpoint}" -force 1> /dev/null && /bin/rm -rf "${mountpoint}"
+		fi
+	done
+	
+	/bin/rm -rf "${os_images_template}"
+}
+
+function sch_log() {
+	printf "%s\n" "$( /bin/date +%F_%H:%M:%S ) ${FUNCNAME[1]}: ${1}" | /usr/bin/tee -a "${log_path}"
+}
+
+function sch_log_exit() {
+	printf "%s\n" "$( /bin/date +%F_%H:%M:%S ) ${FUNCNAME[1]}: ${1}" | /usr/bin/tee -a "${log_path}"; exit ${2:1}
+}
+
+function sch_install_autodmg() {
+	
+	# Get tag and download URL from GitHub API
+	read -d "\n" -r autodmg_tag autodmg_url < <( curl -Ls "https://api.github.com/repos/${autodmg_github_repo}/releases/latest" | awk -F\" '/tag_name/ || /browser_download_url/ { print $(NF-1) }' )
+	
+	# Very basic verification that a tag and URL was returned from the GitHub API
+	if [[ -z ${autodmg_tag} ]] || ! [[ ${autodmg_url} =~ ^http[s]?://.* ]]; then
+		sch_log "Invalid info returned from GitHub API"
+		sch_log "autodmg_tag: ${autodmg_tag}"
+		sch_log "autodmg_url: ${autodmg_url}"
+		exit 1
+	fi
+	
+	# Define path to the local path for the version
+	local autodmg_target_path="$( /usr/bin/dirname "${autodmg}" )/AutoDMG_$( /usr/bin/sed 's/[^0-9\.]//g' <<< "${autodmg_tag}" ).app"
+	
+	if ! [[ -d ${autodmg_target_path} ]]; then
+				
+		# Create autodmg download path
+		local autodmg_dmg_path="/tmp/AutoDMG_${autodmg_tag}.dmg"
+		
+		# Remove AutoDMG download path if it exists
+		/bin/rm -f "${autodmg_dmg_path}" || sch_log_exit "Failed to remove existing AutoDMG download path"
+	
+		# Try to download latest release
+		/usr/bin/curl -sSL "${autodmg_url}" -o "${autodmg_dmg_path}" || sch_log_exit "Failed to download AutoDMG"
+		
+		# Create temporary directory
+		local autodmg_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create AutoDMG mountpoint"
+		
+		# Mount dmg in temporary directory
+		/usr/bin/hdiutil attach "${autodmg_dmg_path}" -noverify -nobrowse -readonly -mountpoint "${autodmg_mountpoint}" -quiet || sch_log_exit "Failed to mount downloaded AutoDMG image"
+		
+		# Add mountpoint to script mountpoints
+		script_mountpoints+=( "${autodmg_mountpoint}" )
+		
+		# Verify expected item exists
+		if ! [[ -d ${autodmg_mountpoint}/AutoDMG.app ]]; then 
+			sch_log_exit "Expected application: ${autodmg_mountpoint}/AutoDMG.app does not exist"
+		fi
+		
+		# Create target parent directory
+		/bin/mkdir -p "$( /usr/bin/dirname "${autodmg}" )" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create parent folder: $( dirname "${autodmg}" )"
+		
+		# Copy and rename Application with tag info
+		/bin/cp -R "${autodmg_mountpoint}/AutoDMG.app" "${autodmg_target_path}" || sch_log_exit "Failed to copy: ${autodmg_mountpoint}/AutoDMG.app to: ${autodmg_target_path}"
+		
+		# Remove existing symbolic link
+		/bin/rm -f "${autodmg}" || sch_log_exit "Failed to remove existing AutoDMG symbolic link"
+
+		# Create a symbolic link to the new version
+		/bin/ln -s "${autodmg_target_path}" "${autodmg}" || sch_log_exit "Failed to create AutoDMG symbolic link"
+	fi
+}
+
+function sch_install_mas() {
+	
+	# Get tag and download URL from github API
+	read -d "\n" -r mas_tag mas_url < <( curl -Ls "https://api.github.com/repos/${mas_github_repo}/releases/latest" | awk -F\" '/tag_name/ || (/browser_download_url/ && $0 !~ /xcarchive/) { print $(NF-1) }' )
+	
+	# Very basic verification that a tag and URL was returned from the github API
+	if [[ -z ${mas_tag} ]] || ! [[ ${mas_url} =~ ^http[s]?://.* ]]; then
+		sch_log "Invalid info returned from GitHub API"
+		sch_log "mas_tag: ${mas_tag}"
+		sch_log "mas_url: ${mas_url}"
+		exit 1
+	fi
+	
+	# Define paths to the local download and unzip directory
+	mas_target_path="$( /usr/bin/dirname "${mas}" )/mas_$( /usr/bin/sed 's/[^0-9\.]//g' <<< "${mas_tag}" )"
+	
+	# Only download if current version doesn't exist
+	if ! [[ -f ${mas_target_path} ]]; then
+		
+		# Create mas-cli download and unzip paths
+		mas_zip_path="/tmp/mas-cli-${mas_tag}.zip"
+		mas_unzip_path="${mas_zip_path%.*}"
+		
+		# Remove mas-cli download path if it exists
+		/bin/rm -f "${mas_zip_path}" || sch_log_exit "Failed to remove existing mas-cli download path"
+	
+		# Try to download latest release
+		/usr/bin/curl -sSL "${mas_url}" -o "${mas_zip_path}" || sch_log_exit "Failed to download mas-cli"
+	
+		# Try to unzip and downloaded file
+		/usr/bin/unzip -qq -o "${mas_zip_path}" -d "${mas_unzip_path}" || sch_log_exit "Failed to unzip mas-cli"
+	
+		# Verify that the expected binary exists in the extraction directory
+		if ! [[ -f "${mas_unzip_path}/mas" ]]; then 
+			sch_log_exit "Expected binary: ${mas_unzip_path}/mas does not exist"
+		fi
+		
+		# Create target parent directory
+		/bin/mkdir -p "$( dirname "${mas}" )" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create folder: ${1}"
+		
+		# Move and rename binary with tag info
+		/bin/mv "${mas_unzip_path}/mas" "${mas_target_path}" || sch_log_exit "Failed to move: ${mas_unzip_path}/mas to: ${mas_target_path}"
+		
+		# Remove existing symbolic link
+		/bin/rm -f "${mas}" || sch_log_exit "Failed to remove existing mas-cli symbolic link"
+		
+		# Create a symbolic link to the new version
+		/bin/ln -s "${mas_target_path}" "${mas}" || sch_log_exit "Failed to create mas-cli symbolic link"
+	fi
+}
+
+function sch_install_deploystudio() {
+
+	# Get the latest DeployStudio version
+	local ds_latest_version=$( /usr/bin/curl -sSL http://www.deploystudio.com/Downloads/_dss.current )
+	
+	# Very basic verification that a valid version was returned
+	if ! [[ ${ds_latest_version} =~ [0-9] ]]; then
+		sch_log_exit "Invalid info returned for current DeployStudio version"	
+	fi
+	
+	# Define path to the local path for the version
+	local ds_target_name="DeployStudioAdmin_$( /usr/bin/sed 's/[^0-9\.]//g' <<< "${ds_latest_version}" )"
+	local ds_target_path="$( /usr/bin/dirname "${ds_admin}" )/${ds_target_name}.dmg"
+	local ds_target_path_sparsebundle="$( /usr/bin/dirname "${ds_admin}" )/${ds_target_name}.sparsebundle"
+	
+	if ! [[ -f ${ds_target_path} ]]; then
+	
+		# Get the path to a downloaded dmg for the latest version reported
+		local ds_latest_path=$( /usr/bin/find "${ds_archive_path}" -type f -regex .*[Ss]erver.*v${ds_latest_version}.dmg$ -print -quit )
+	
+		# If no local path was found, try to download that version
+		if ! [[ -f ${ds_latest_path} ]]; then
+		
+			#
+			local ds_latest_path="${ds_archive_path}/${ds_latest_name}" 
+			local ds_latest_name="DeployStudioServer_v${ds_latest_version}.dmg"
+			local ds_latest_url="http://www.deploystudio.com/Downloads/${ds_latest_name}"
+		
+			# Create target parent directory
+			/bin/mkdir -p "${ds_archive_path}" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create parent folder: ${ds_archive_path}"
+		
+			# Try to download latest release
+			/usr/bin/curl -sSL "${ds_latest_url}" -o "${ds_latest_path}" || sch_log_exit "Failed to download DeployStudio"
+		fi
+	
+		local ds_installer_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${ds_latest_path}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+		if ! [[ -d ${ds_installer_mountpoint} ]]; then
+			
+			# Create temporary directory
+			local ds_installer_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create DeployStudio Installer mountpoint"
+			
+			# Mount dmg in temporary directory
+			/usr/bin/hdiutil attach "${ds_latest_path}" -noverify -nobrowse -readonly -mountpoint "${ds_installer_mountpoint}" -quiet || sch_log_exit "Failed to mount DeployStudio Installer image"
+			
+			# Add mountpoint to script mountpoints
+			#script_mountpoints+=( "${ds_installer_mountpoint}" )
+		fi
+		
+		# Create path to expected admin installer
+		local ds_installer_admin_path="${ds_installer_mountpoint}/DeployStudioServer_v${ds_latest_version}.mpkg/Contents/Packages/deploystudioAdmin.pkg"
+		
+		# Verify expected item exists
+		if ! [[ -e ${ds_installer_admin_path} ]]; then 
+			sch_log_exit "Expected application: ${ds_installer_admin_path} does not exist"
+		fi
+
+		# Create target parent directory
+		/bin/mkdir -p "$( dirname "${ds_target_path}" )" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create folder: ${ds_target_path}"
+
+		# Remove DeployStudio sparsebundle if it exists
+		/bin/rm -rf "${ds_target_path_sparsebundle}" || sch_log_exit "Failed to remove DeployStudio Admin sparsebundle"
+
+		# Create target dmg to install DeployStudio Admin pkg in
+		/usr/bin/hdiutil create -type SPARSEBUNDLE -size 150m -fs HFS+J -volname "${ds_target_name}" "${ds_target_path_sparsebundle}" -quiet || sch_log_exit "Failed to create DeployStudio target install dmg"
+
+		# Create target dmg mountpont
+		local ds_target_sparsebundle_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create DeployStudio target install dmg mountpoint"
+
+		# Mount dmg in temporary directory
+		/usr/bin/hdiutil attach "${ds_target_path_sparsebundle}" -noverify -nobrowse -readwrite -owners on -mountpoint "${ds_target_sparsebundle_mountpoint}" -quiet || sch_log_exit "Failed to mount DeployStudio target install dmg"
+
+		# Add mountpoint to script mountpoints
+		script_mountpoints+=( "${ds_target_sparsebundle_mountpoint}" )
+		
+		# Install DeployStudio Admin to the temporary disk image
+		# NOTE: The DeployStudio Install PKG removes the installed version when another path is targeted. Therefore I extract the payload manually using pax		
+		( cd "${ds_target_sparsebundle_mountpoint}"; /bin/pax -f "${ds_installer_admin_path}/Contents/Archive.pax.gz" -z -r "*/DeployStudio Admin.app*" )
+				
+		# Detach DeployStudio target install dmg
+		if [[ -d ${ds_target_sparsebundle_mountpoint} ]]; then
+			/usr/bin/hdiutil detach "${ds_target_sparsebundle_mountpoint}" -force 1> /dev/null && /bin/rm -rf "${ds_target_sparsebundle_mountpoint}" || sch_log_exit "Failed to detach DeployStudio target install dmg mounted at: ${ds_target_mountpoint}"
+		fi
+		
+		# Remove DeployStudio dmg if it exists
+		/bin/rm -rf "${ds_target_path}" || sch_log_exit "Failed to remove DeployStudio Admin sparsebundle"
+		
+		# Convert sparsebundle to readonly dmg
+		/usr/bin/hdiutil convert -format UDZO "${ds_target_path_sparsebundle}" -o "${ds_target_path}" || sch_log_exit "Failed to convert DeployStudio Admin sparsebundle to dmg"
+		
+		# Remove DeployStudio sparsebundle
+		/bin/rm -rf "${ds_target_path_sparsebundle}" || sch_log_exit "Failed to remove DeployStudio Admin sparsebundle"
+		
+		# Remove existing symbolic link
+		/bin/rm -f "${ds_admin}" || sch_log_exit "Failed to remove existing DeployStudio Admin symbolic link"
+		
+		# Create a symbolic link to the new version
+		/bin/ln -s "${ds_target_path}" "${ds_admin}" || sch_log_exit "Failed to create DeployStudio Admin symbolic link"
+		
+		# Detach DeployStudio Installer dmg
+		if [[ -d ${ds_installer_mountpoint} ]]; then
+			/usr/bin/hdiutil detach "${ds_installer_mountpoint}" -force 1> /dev/null && /bin/rm -rf "${ds_installer_mountpoint}" || sch_log_exit "Failed to detach DeployStudio target install dmg mounted at: ${ds_target_mountpoint}"
+		fi
+	fi
+}
+
+function sch_install_application() {
+	
+	# Sign in to App Store
+	local mas_output=$( "${mas}" signin "${appstore_appleid}" "${appstore_password}" )
+	if [[ ${mas_output} =~ "Error" ]]; then
+		sch_log_exit "Failed to sign in to the App Store using AppleID: ${appstore_appleid}"
+	fi
+	
+	# Install or upgrade application
+	local mas_output=$( "${mas}" install "${appstore_id}" 2>&1 )
+	if [[ ${mas_output} =~ 'is already installed' ]]; then
+		sch_log "Latest version of application with id ${appstore_id} is already installed"
+	fi
+	
+	# Get path to all applications matching both the name and the version of the reported application
+	# NOTE: Currently if there are multiple paths, only the first one is used
+	IFS=$'\n' app_paths+=( $( /usr/bin/mdfind "(** == ${appstore_id} && kMDItemCFBundleIdentifier == 'com.apple.InstallAssistant.*'c && kMDItemContentType=com.apple.application-bundle)" ) )
+	
+	# Get first path in app_paths array
+	local app_path="${app_paths[0]}"
+	
+	# Verfiy path exists
+	if ! [[ -d ${app_path} ]]; then
+		sch_log_exit "No path returned from mdfind"	
+	fi
+	
+	# Get installer name
+	local app_name=$( /usr/libexec/PlistBuddy -c "Print CFBundleDisplayName" "${app_path}/Contents/Info.plist" )
+	
+	# Kill the application if it is running
+	/usr/bin/osascript -e 'quit app '\"${app_name}\"'' || sch_log_exit "Failed to quit process with name: ${app_name}"
+	
+	# Get mountpoint for the InstallESD dmg inside the installer (if it is mounted)
+	local installesd_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${app_path}/Contents/SharedSupport/InstallESD.dmg\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+	if ! [[ -d ${installesd_mountpoint} ]]; then
+		
+		# Create temporary directory
+		local installesd_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create InstallESD mountpoint"
+		
+		# Attach the InstallESD to the temporary directory
+		/usr/bin/hdiutil attach "${app_path}/Contents/SharedSupport/InstallESD.dmg" -noverify -nobrowse -readonly -owners on -mountpoint "${installesd_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach InstallESD: ${app_path}/Contents/SharedSupport/InstallESD.dmg to mountpoint: ${installesd_mountpoint}"
+	fi
+	
+	# Add mountpoint to script mountpoints
+	script_mountpoints+=( "${installesd_mountpoint}" )
+	
+	# Get version and build
+	if [[ -f ${installesd_mountpoint}/BaseSystem.dmg ]]; then
+		
+		# Create mountpoint for BaseSystem.dmg
+		local basesystem_mountpoint=$( mktemp -d /private/tmp/dmg.XXXXX ) || sch_log_exit "Unable to create BaseSystem mountpoint"
+		
+		# Attach BaseSystem.dmg
+		/usr/bin/hdiutil attach "${installesd_mountpoint}/BaseSystem.dmg" -noverify -nobrowse -readonly -owners on -mountpoint "${basesystem_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach BaseSystem: ${installesd_mountpoint}/BaseSystem.dmg to mountpoint: ${basesystem_mountpoint}"
+			
+		# Add mountpoint to mountpoints to remove after checking has finished
+		script_mountpoints+=( "${basesystem_mountpoint}" )
+		
+		# Set the SystemVersion.plist path	
+		local systemversion_path="${base_system_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
+	else
+		local systemversion_path="${installesd_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
+	fi
+	
+	# Verify SystemVersion.plist exists
+	if ! [[ -f ${systemversion_path} ]]; then
+		sch_log_exit "SystemVersion.plist not found at: ${systemversion_path}"	
+	fi
+	
+	# Get installer os build and version
+	os_installer_version=$( /usr/libexec/PlistBuddy -c "Print :ProductUserVisibleVersion" "${systemversion_path}" )
+	os_installer_build_version=$( /usr/libexec/PlistBuddy -c "Print :ProductBuildVersion" "${systemversion_path}" )
+	
+	# Detach BaseSystem dmg
+	if [[ -d ${basesystem_mountpoint} ]]; then
+		/usr/bin/hdiutil detach "${basesystem_mountpoint}" -force 1> /dev/null && rm -rf "${basesystem_mountpoint}" || sch_log_exit "Failed to detach BaseSystem dmg mounted at: ${basesystem_mountpoint}"
+	fi
+	
+	# Detach InstallESD dmg
+	if [[ -d ${installesd_mountpoint} ]]; then
+		/usr/bin/hdiutil detach "${installesd_mountpoint}" -force 1> /dev/null && rm -rf "${installesd_mountpoint}" || sch_log_exit "Failed to detach InstallESD dmg mounted at: ${installesd_mountpoint}"
+	fi
+	
+	# Remove quarantine attribute if present
+	/usr/bin/xattr -d -r com.apple.quarantine "${app_path}" > /dev/null 2>&1
+	
+	# Create archive name and archive path variables
+	local app_archivename=$( sed 's/\ //g' <<< "${app_name}_${os_installer_version}-${os_installer_build_version}" )
+	os_installer_archivepath="${appstore_archive_path}/${app_archivename}.dmg"
+
+	if ! [[ -f ${os_installer_archivepath} ]]; then
+		
+		# Create target parent directory
+		/bin/mkdir -p "${appstore_archive_path}" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create parent folder: ${appstore_archive_path}"
+	
+		# Create archive dmg
+		/usr/bin/hdiutil create -srcfolder "${app_path}" -volname "${app_archivename}" "${os_installer_archivepath}" 1> /dev/null || sch_log_exit "Failed to create dmg archive from downloaded application at: ${app_path}"
+	fi
+}
+
+function sch_create_autodmg_template() {
+	
+	# Create target parent directory
+	/bin/mkdir -p "${os_images_archive}" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create parent folder: ${os_images_archive}"
+	
+	# Remove existing template
+	/bin/rm -f "${os_images_template}" || sch_log_exit "Failed to remove existing AutoDMG template"
+	
+	# Create the template
+	/usr/libexec/PlistBuddy -c "Add TemplateFormat string '1.0'" "${os_images_template}"
+	/usr/libexec/PlistBuddy -c "Add OutputPath string '${os_image_autodmg}'" "${os_images_template}"
+	/usr/libexec/PlistBuddy -c "Add VolumeName string 'Macintosh HD'" "${os_images_template}"
+	/usr/libexec/PlistBuddy -c "Add ApplyUpdates bool false" "${os_images_template}"
+	/usr/libexec/PlistBuddy -c "Add AdditionalPackages array" "${os_images_template}"
+	/usr/libexec/PlistBuddy -c "Add IncludeTemplates array" "${os_images_template}"
+}
+
+function sch_create_autodmg_image() {
+
+	# Get mountpoint for the InstallESD dmg inside the installer (if it is mounted)
+	local os_installer_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${os_installer_archivepath}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+	if ! [[ -d ${os_installer_mountpoint} ]]; then
+		
+		# Create temporary directory
+		local os_installer_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create OS Installer dmg mountpoint"
+		
+		# Attach the InstallESD to the temporary directory
+		/usr/bin/hdiutil attach "${os_installer_archivepath}" -noverify -nobrowse -readonly -owners on -mountpoint "${os_installer_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach OS Installer dmg: ${os_installer_archivepath} to mountpoint: ${os_installer_mountpoint}"
+		
+		# Add mountpoint to mountpoints to remove after checking has finished
+		script_mountpoints+=( "${os_installer_mountpoint}" )
+	fi
+
+	# Get the path to the installer contained in the dmg
+	local os_installer=$( /usr/bin/find "${os_installer_mountpoint}" -depth 1 -type d -regex .*Install.*\.app.* -print -quit )
+	
+	# Verify an Installer app was found inside the dmg
+	if ! [[ -d ${os_installer} ]]; then
+		sch_log_exit "Found no OS Installer in the OS Install dmg"
+	fi
+
+	# Run AutoDMG
+	"${autodmg}/Contents/MacOS/AutoDMG" --root --log-level 3 --logfile "${log_path}" build --force --installer "${os_installer}" "${os_images_template}" || sch_log_exit "Failed to create OS Image using AutoDMG"
+
+}
+
+function sch_create_ds_nbi() {
+
+	# Verify OS Image exist
+	if ! [[ -f ${os_image} ]]; then
+		sch_log_exit "${os_image}: No such file or directory"
+	fi
+		
+	# Get mountpoint for the os image (if it is mounted)
+	local os_image_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${os_image}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+	if ! [[ -d ${os_image_mountpoint} ]]; then
+		
+		# Create temporary directory
+		local os_image_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create OS Image mountpoint"
+		
+		# Attach the InstallESD to the temporary directory
+		/usr/bin/hdiutil attach "${os_image}" -noverify -nobrowse -readonly -owners on -mountpoint "${os_image_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach OS Image: ${os_image} to mountpoint: ${os_image_mountpoint}"
+	fi
+	
+	# Add mountpoint to script mountpoints
+	script_mountpoints+=( "${os_image_mountpoint}" )
+
+	# Verify DeployStudio Admin dmg exists
+	if ! [[ -f ${ds_admin} ]]; then
+		sch_log_exit "${ds_admin}: No such file or directory"
+	elif [[ -L ${ds_admin} ]]; then
+		ds_admin=$( /usr/bin/readlink "${ds_admin}" )
+	fi
+
+	# Get mountpoint for the DeployStudio Admin dmg (if it is mounted)
+	local ds_admin_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${ds_admin}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+	if ! [[ -d ${ds_admin_mountpoint} ]]; then
+		
+		# Create temporary directory
+		local ds_admin_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create DeployStudio Admin dmg mountpoint"
+		
+		# Attach the DeployStudio Admin dmg to the temporary directory
+		/usr/bin/hdiutil attach "${ds_admin}" -noverify -nobrowse -readonly -owners on -mountpoint "${ds_admin_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach DeployStudio Admin dmg: ${ds_admin} to mountpoint: ${ds_admin_mountpoint}"
+	fi
+	
+	# Add mountpoint to script mountpoints
+	script_mountpoints+=( "${ds_admin_mountpoint}" )
+
+	# Create path to sysbuilder script
+	local ds_sysbuilder="${ds_admin_mountpoint}/DeployStudio Admin.app/Contents/Applications/DeployStudio Assistant.app/Contents/Resources/sysBuilder/sys_builder_rp.sh"
+
+	# Verify sysbuilder exist and is executable
+	if ! [[ -x ${ds_sysbuilder} ]]; then
+		sch_log_exit "${ds_sysbuilder}: No such file or directory"
+	fi
+
+	# Create the DeployStudio NBI
+	"${ds_sysbuilder}" \
+		-basesystem "${os_image_mountpoint}" \
+		-type netboot \
+	    -id "$( jot -r 1  1 4095 )" \
+	    -name "${nbi_name}" \
+	    -dest "${nbi_archive}" \
+	    -protocol "NFS" \
+	    -loc "default" \
+	    -serverurl "${ds_server_url}" \
+	    -serverurl2 "${ds_server_url}" \
+	    -displaylogs \
+	    -timeout 30 \
+	    -displaysleep 10 \
+	    -enablepython \
+	    -enableruby \
+	    -disablewirelesssupport \
+	    -ntp "time.euro.apple.com" \
+	    -customtitle "DeployStudio ${os_installer_version}-${os_installer_build_version}" \
+	    -smb1only || sch_log_exit "Failed to create the NBI"
+	
+	# Verify that the NBImageInfo.plist exists
+	nbi_nbimageinfo="${nbi_path}/NBImageInfo.plist"
+	if ! [[ -f ${nbi_nbimageinfo} ]]; then
+		sch_log_exit "Found no NBImageInfo.plist at expected path after creating the nbi"
+	fi
+	
+	# Disable the NBI by default to let the server enable when ready for testing
+	/usr/libexec/PlistBuddy -c "Set :IsEnabled false" "${nbi_nbimageinfo}"
+	
+	# Enable verbose boot by default
+	/usr/libexec/PlistBuddy -c  "Add 'Kernel Flags' string '-v'" "${nbi_path}/i386/com.apple.Boot.plist"
+	
+	# Detach DeployStudio Admin dmg
+	if [[ -d ${ds_admin_mountpoint} ]]; then
+		/usr/bin/hdiutil detach "${ds_admin_mountpoint}" -force 1> /dev/null && rm -rf "${ds_admin_mountpoint}" || sch_log_exit "Failed to detach DeployStudio Admin dmg mounted at: ${ds_admin_mountpoint}"
+	fi
+}
+
+function sch_upload_os_images() {
+
+	# Sync all OS Images locally to remote server
+	local all_images=( $( /usr/bin/find "${os_images_archive}" -depth 1 -type f -regex .*\/macOS.*hfs.dmg$ ) )
+	if (( 0 < ${#all_images[@]} )); then
+		/usr/bin/rsync -e "ssh" -avz "${all_images[@]}" "${server_user}@${server_hostname}:${server_osimages_path}/" || sch_log_exit "Failed to upload OS Images to remote server"
+	fi
+}
+
+function sch_upload_ds_nbi() {
+
+	# Sync all NBIs locally to remote server
+	local all_nbis=( $( /usr/bin/find "${nbi_archive}" -depth 1 -type d -regex .*/DS.*nbi$ ) )
+	if (( 0 < ${#all_nbis[@]} )); then
+		/usr/bin/rsync -e "ssh" -rlpgoDvz "${all_nbis[@]}" "${server_user}@${server_hostname}:${server_nbi_path}/" || sch_log_exit "Failed to upload NBI to remote server"
+	fi
+}
+
+###
+### MAIN SCRIPT
+###
+
+# Verify script is run with admin privileges
+if [[ $EUID -ne 0 ]]; then 
+	sch_log_exit "This script must be run with admin privileges"
+fi
+
+# Setup trap
+trap sch_trap EXIT
+
+# Install or update dependencies to latest versions
+sch_install_autodmg
+sch_install_mas
+sch_install_deploystudio
+
+# Install or update installer to latest version
+sch_install_application
+
+# NOTE: These must match so the rest of the script will find the correct image
+# os_image is used later in the script as source for DeployStudio
+# os_image_autodmg is the filed in the autodmg tamplate that will be used to name the image created.
+# They have to match, or else the rest of the script is not working.
+os_image="${os_images_archive}/macOS_${os_installer_version}-${os_installer_build_version}.hfs.dmg"
+os_image_autodmg="${os_images_archive}/macOS_%OSVERSION%-%OSBUILD%.hfs.dmg"
+
+# Check if an AutoDMG image is already created
+if ! [[ -f ${os_image} ]]; then
+
+	sch_create_autodmg_template
+	sch_create_autodmg_image
+fi
+
+nbi_name="DS_${os_installer_version}-${os_installer_build_version}"
+nbi_path="${nbi_archive}/${nbi_name}.nbi"
+
+if ! [[ -d "${nbi_path}" ]]; then
+	
+	# Check if an DeployStudio NBI is already created
+	sch_create_ds_nbi
+fi
+
+sch_upload_os_images
+sch_upload_ds_nbi

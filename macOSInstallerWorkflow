@@ -11,7 +11,7 @@
 #		* Copy the numbers between '../app/../id' and '?'
 #		* Example: https://itunes.apple.com/se/app/macos-sierra/id1127487414?l=en&mt=12
 #		* Example ID: 1127487414
-appstore_id="1127487414"
+appstore_id="1246284741"
 appstore_appleid=""
 appstore_password=""
 
@@ -230,8 +230,8 @@ function sch_install_deploystudio() {
 		if ! [[ -f ${ds_latest_path} ]]; then
 		
 			#
-			local ds_latest_path="${ds_archive_path}/${ds_latest_name}" 
 			local ds_latest_name="DeployStudioServer_v${ds_latest_version}.dmg"
+			local ds_latest_path="${ds_archive_path}/${ds_latest_name}" 
 			local ds_latest_url="http://www.deploystudio.com/Downloads/${ds_latest_name}"
 		
 			# Create target parent directory
@@ -254,14 +254,6 @@ function sch_install_deploystudio() {
 			#script_mountpoints+=( "${ds_installer_mountpoint}" )
 		fi
 		
-		# Create path to expected admin installer
-		local ds_installer_admin_path="${ds_installer_mountpoint}/DeployStudioServer_v${ds_latest_version}.mpkg/Contents/Packages/deploystudioAdmin.pkg"
-		
-		# Verify expected item exists
-		if ! [[ -e ${ds_installer_admin_path} ]]; then 
-			sch_log_exit "Expected application: ${ds_installer_admin_path} does not exist"
-		fi
-
 		# Create target parent directory
 		/bin/mkdir -p "$( dirname "${ds_target_path}" )" >> "${log_path}" 2>&1 || sch_log_exit "Failed to create folder: ${ds_target_path}"
 
@@ -280,10 +272,39 @@ function sch_install_deploystudio() {
 		# Add mountpoint to script mountpoints
 		script_mountpoints+=( "${ds_target_sparsebundle_mountpoint}" )
 		
-		# Install DeployStudio Admin to the temporary disk image
-		# NOTE: The DeployStudio Install PKG removes the installed version when another path is targeted. Therefore I extract the payload manually using pax		
-		( cd "${ds_target_sparsebundle_mountpoint}"; /bin/pax -f "${ds_installer_admin_path}/Contents/Archive.pax.gz" -z -r "*/DeployStudio Admin.app*" )
+		# Create path to expected admin installer
+		local ds_installer_admin_path="${ds_installer_mountpoint}/DeployStudioServer_v${ds_latest_version}.mpkg/Contents/Packages/deploystudioAdmin.pkg"
+		
+		# Verify expected item exists
+		if [[ -e ${ds_installer_admin_path} ]]; then 
+			
+			# Install DeployStudio Admin to the temporary disk image
+			# NOTE: The DeployStudio Install PKG removes the installed version when another path is targeted. Therefore I extract the payload manually using pax		
+			( cd "${ds_target_sparsebundle_mountpoint}"; /bin/pax -f "${ds_installer_admin_path}/Contents/Archive.pax.gz" -z -r "*/DeployStudio Admin.app*" )
+			
+		else
+			
+			# Create 
+			local ds_installer_server_path="${ds_installer_mountpoint}/DeployStudioServer_v${ds_latest_version}.pkg"
+			
+			# Create temporary directory
+			local ds_installer_admin_expand_path="/tmp/DeployStudioServer_v${ds_latest_version}"
+			
+			# Remove DeployStudio dmg if it exists
+			if [[ -d ${ds_installer_admin_expand_path} ]]; then
+				/bin/rm -rf "${ds_installer_admin_expand_path}" || sch_log_exit "Failed to remove DeployStudio Admin sparsebundle"
+			fi
+		
+			if [[ -e ${ds_installer_server_path} ]]; then
+				/usr/sbin/pkgutil --expand "${ds_installer_server_path}" "${ds_installer_admin_expand_path}" || sch_log_exit "Failed to expand the DeployStudio Server installer package"
 				
+				( cd "${ds_target_sparsebundle_mountpoint}"; /bin/cat "${ds_installer_admin_expand_path}/DeployStudioAdmin.pkg/Payload" | /usr/bin/gunzip -dc | /usr/bin/cpio -i )
+			fi
+			
+			# Remove temporary DeployStudio pkg expand tmp path
+			/bin/rm -rf "${ds_installer_admin_expand_path}" || sch_log_exit "Failed to remove DeployStudio pkg expand tmp path"
+		fi
+		
 		# Detach DeployStudio target install dmg
 		if [[ -d ${ds_target_sparsebundle_mountpoint} ]]; then
 			/usr/bin/hdiutil detach "${ds_target_sparsebundle_mountpoint}" -force 1> /dev/null && /bin/rm -rf "${ds_target_sparsebundle_mountpoint}" || sch_log_exit "Failed to detach DeployStudio target install dmg mounted at: ${ds_target_mountpoint}"
@@ -294,7 +315,7 @@ function sch_install_deploystudio() {
 		
 		# Convert sparsebundle to readonly dmg
 		/usr/bin/hdiutil convert -format UDZO "${ds_target_path_sparsebundle}" -o "${ds_target_path}" || sch_log_exit "Failed to convert DeployStudio Admin sparsebundle to dmg"
-		
+	
 		# Remove DeployStudio sparsebundle
 		/bin/rm -rf "${ds_target_path_sparsebundle}" || sch_log_exit "Failed to remove DeployStudio Admin sparsebundle"
 		
@@ -370,7 +391,7 @@ function sch_install_application() {
 		script_mountpoints+=( "${basesystem_mountpoint}" )
 		
 		# Set the SystemVersion.plist path	
-		local systemversion_path="${base_system_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
+		local systemversion_path="${basesystem_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
 	else
 		local systemversion_path="${installesd_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
 	fi

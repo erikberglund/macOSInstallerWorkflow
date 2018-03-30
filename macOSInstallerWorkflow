@@ -504,7 +504,7 @@ function sch_create_ds_nbi() {
 	fi
 		
 	# Get mountpoint for the os image (if it is mounted)
-	local os_image_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${os_image}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+	local os_image_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${os_image}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string[1]/text()" 2>/dev/null )
 	if ! [[ -d ${os_image_mountpoint} ]]; then
 		
 		# Create temporary directory
@@ -512,6 +512,24 @@ function sch_create_ds_nbi() {
 		
 		# Attach the InstallESD to the temporary directory
 		/usr/bin/hdiutil attach "${os_image}" -noverify -nobrowse -readonly -owners on -mountpoint "${os_image_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach OS Image: ${os_image} to mountpoint: ${os_image_mountpoint}"
+		
+		local os_basesystem_path=$( find "${os_image_mountpoint}" -depth 2 -type f -regex .*\/BaseSystem.dmg$ )
+		if [[ -f ${os_basesystem_path} ]]; then
+			
+			local os_basesystem_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${os_basesystem_path}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string[1]/text()" 2>/dev/null )
+			if ! [[ -d ${os_basesystem_mountpoint} ]]; then
+				
+				# Create temporary directory
+				local os_basesystem_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create OS BaseSystem mountpoint"
+			
+				# Attach the InstallESD to the temporary directory
+				/usr/bin/hdiutil attach "${os_basesystem_path}" -noverify -nobrowse -readonly -owners on -mountpoint "${os_basesystem_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach OS BaseSystem Image: ${os_basesystem_path} to mountpoint: ${os_basesystem_mountpoint}"
+			fi
+			# Add mountpoint to script mountpoints
+			script_mountpoints+=( "${os_image_mountpoint}" )
+			
+			local os_image_mountpoint="${os_basesystem_mountpoint}"
+		fi
 	fi
 	
 	# Add mountpoint to script mountpoints
@@ -549,23 +567,23 @@ function sch_create_ds_nbi() {
 	# Create the DeployStudio NBI
 	"${ds_sysbuilder}" \
 		-basesystem "${os_image_mountpoint}" \
-		-type netboot \
-	    -id "$( jot -r 1  1 4095 )" \
-	    -name "${nbi_name}" \
-	    -dest "${nbi_archive}" \
-	    -protocol "NFS" \
-	    -loc "default" \
-	    -serverurl "${ds_server_url}" \
-	    -serverurl2 "${ds_server_url}" \
-	    -displaylogs \
-	    -timeout 30 \
-	    -displaysleep 10 \
-	    -enablepython \
-	    -enableruby \
-	    -disablewirelesssupport \
-	    -ntp "time.euro.apple.com" \
-	    -customtitle "DeployStudio ${os_installer_version}-${os_installer_build_version}" \
-	    -smb1only || sch_log_exit "Failed to create the NBI"
+			-type netboot \
+				-id "$( jot -r 1 1 4095 )" \
+					-name "${nbi_name}" \
+						-dest "${nbi_archive}" \
+							-protocol "NFS" \
+								-loc "default" \
+									-serverurl "${ds_server_url}" \
+										-serverurl2 "${ds_server_url}" \
+											-displaylogs \
+												-timeout 30 \
+													-displaysleep 10 \
+														-enablepython \
+															-enableruby \
+																-disablewirelesssupport \
+																	-ntp "time.euro.apple.com" \
+																		-customtitle "DeployStudio ${os_installer_version}-${os_installer_build_version}" \
+																			-smb1only || sch_log_exit "Failed to create the NBI"
 	
 	# Verify that the NBImageInfo.plist exists
 	nbi_nbimageinfo="${nbi_path}/NBImageInfo.plist"

@@ -15,6 +15,9 @@ appstore_id="1246284741"
 appstore_appleid=""
 appstore_password=""
 
+# Required to find the installer application
+installer_bundle_identifier="com.apple.InstallAssistant.HighSierra"
+
 # Base
 base_path="/Users/Shared"
 
@@ -347,8 +350,10 @@ function sch_install_application() {
 	fi
 	
 	# Get path to all applications matching both the name and the version of the reported application
-	# NOTE: Currently if there are multiple paths, only the first one is used
-	IFS=$'\n' app_paths+=( $( /usr/bin/mdfind "(** == ${appstore_id} && kMDItemCFBundleIdentifier == 'com.apple.InstallAssistant.*'c && kMDItemContentType=com.apple.application-bundle)" ) )
+	IFS=$'\n' app_paths=( $( /usr/bin/mdfind "(** == ${1} && kMDItemCFBundleIdentifier == 'com.apple.InstallAssistant.*'c && kMDItemContentType=com.apple.application-bundle)" ) )
+	if (( ${#app_paths[@]} == 0 )); then
+		IFS=$'\n' app_paths=( $( /usr/bin/mdfind "(kMDItemCFBundleIdentifier == '${installer_bundle_identifier}'c && kMDItemContentType=com.apple.application-bundle)" ) )
+	fi
 	
 	# Get first path in app_paths array
 	local app_path="${app_paths[0]}"
@@ -364,32 +369,45 @@ function sch_install_application() {
 	# Kill the application if it is running
 	/usr/bin/osascript -e 'quit app '\"${app_name}\"'' || sch_log_exit "Failed to quit process with name: ${app_name}"
 	
-	# Get mountpoint for the InstallESD dmg inside the installer (if it is mounted)
-	local installesd_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${app_path}/Contents/SharedSupport/InstallESD.dmg\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
-	if ! [[ -d ${installesd_mountpoint} ]]; then
-		
-		# Create temporary directory
-		local installesd_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create InstallESD mountpoint"
-		
-		# Attach the InstallESD to the temporary directory
-		/usr/bin/hdiutil attach "${app_path}/Contents/SharedSupport/InstallESD.dmg" -noverify -nobrowse -readonly -owners on -mountpoint "${installesd_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach InstallESD: ${app_path}/Contents/SharedSupport/InstallESD.dmg to mountpoint: ${installesd_mountpoint}"
+	# Set the basesystem path to the new installer formats path
+	local basesystem_path="${app_path}/Contents/SharedSupport/BaseSystem.dmg"
+	
+	if ! [[ -f ${basesystem_path} ]]; then
+	
+		# Get mountpoint for the InstallESD dmg inside the installer (if it is mounted)
+		local installesd_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${app_path}/Contents/SharedSupport/InstallESD.dmg\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+		if ! [[ -d ${installesd_mountpoint} ]]; then
+	
+			# Create temporary directory
+			local installesd_mountpoint="$( /usr/bin/mktemp -d /private/tmp/dmg.XXXXX )" || sch_log_exit "Failed to create InstallESD mountpoint"
+	
+			# Attach the InstallESD to the temporary directory
+			/usr/bin/hdiutil attach "${app_path}/Contents/SharedSupport/InstallESD.dmg" -noverify -nobrowse -readonly -owners on -mountpoint "${installesd_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach InstallESD: ${app_path}/Contents/SharedSupport/InstallESD.dmg to mountpoint: ${installesd_mountpoint}"
+		fi
+
+		local basesystem_path="${installesd_mountpoint}/BaseSystem.dmg"
+
+		# Add mountpoint to script mountpoints
+		script_mountpoints+=( "${installesd_mountpoint}" )
 	fi
-	
-	# Add mountpoint to script mountpoints
-	script_mountpoints+=( "${installesd_mountpoint}" )
-	
+
 	# Get version and build
-	if [[ -f ${installesd_mountpoint}/BaseSystem.dmg ]]; then
-		
+	if [[ -f ${basesystem_path} ]]; then
+	
 		# Create mountpoint for BaseSystem.dmg
-		local basesystem_mountpoint=$( mktemp -d /private/tmp/dmg.XXXXX ) || sch_log_exit "Unable to create BaseSystem mountpoint"
-		
-		# Attach BaseSystem.dmg
-		/usr/bin/hdiutil attach "${installesd_mountpoint}/BaseSystem.dmg" -noverify -nobrowse -readonly -owners on -mountpoint "${basesystem_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach BaseSystem: ${installesd_mountpoint}/BaseSystem.dmg to mountpoint: ${basesystem_mountpoint}"
+		# Get mountpoint for the InstallESD dmg inside the installer (if it is mounted)
+		local basesystem_mountpoint=$( /usr/bin/hdiutil info -plist | /usr/bin/xpath "/plist/dict/key[.='images']/following-sibling::array/dict/key[.='image-path']/following-sibling::string[1][contains(., \"${basesystem_path}\")]/../key[.='system-entities']/following-sibling::array/dict/key[.='mount-point']/following-sibling::string/text()" 2>/dev/null )
+		if ! [[ -d ${basesystem_mountpoint} ]]; then
 			
-		# Add mountpoint to mountpoints to remove after checking has finished
-		script_mountpoints+=( "${basesystem_mountpoint}" )
+			local basesystem_mountpoint=$( mktemp -d /private/tmp/dmg.XXXXX ) || sch_log_exit "Unable to create BaseSystem mountpoint"
+	
+			# Attach BaseSystem.dmg
+			/usr/bin/hdiutil attach "${basesystem_path}" -noverify -nobrowse -readonly -owners on -mountpoint "${basesystem_mountpoint}" 1> /dev/null || sch_log_exit "Failed to attach BaseSystem: ${basesystem_path} to mountpoint: ${basesystem_mountpoint}"
 		
+			# Add mountpoint to mountpoints to remove after checking has finished
+			script_mountpoints+=( "${basesystem_mountpoint}" )
+		fi
+	
 		# Set the SystemVersion.plist path	
 		local systemversion_path="${basesystem_mountpoint}/System/Library/CoreServices/SystemVersion.plist"
 	else
